@@ -1,0 +1,33 @@
+# @package _group_
+
+defaults:
+  - model: null
+
+hydra:
+  run:
+    dir: ${common_eval.results_path}/viterbi_pad_audio_debug
+  sweep:
+    dir: ${common_eval.results_path}
+    subdir: viterbi_pad_audio
+
+task:
+  _name: hubert_pretraining
+  single_target: true
+  fine_tuning: true
+  data: ???
+  normalize: ???
+  already_enhanced: ???
+  enhanced_data_dir: ???
+  pad_audio: true
+
+decoding:
+  type: viterbi
+  unique_wer_file: true
+common_eval:
+  results_path: ???
+  path: ???
+  post_process: letter
+dataset:
+  max_tokens: 1100000
+  num_workers: 0
+  gen_subset: ???

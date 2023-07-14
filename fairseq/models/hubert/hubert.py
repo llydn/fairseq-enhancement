@@ -24,13 +24,105 @@ from fairseq.models.wav2vec.wav2vec2 import (
     ConvFeatureExtractionModel,
     TransformerEncoder,
 )
-from fairseq.modules import GradMultiply, LayerNorm
+from fairseq.modules import GradMultiply, LayerNorm, MultiheadAttention
 from fairseq.tasks.hubert_pretraining import (
     HubertPretrainingConfig,
     HubertPretrainingTask,
 )
+from fairseq import checkpoint_utils
+import os
+import asteroid
+import json
+import random
+import soundfile as sf
 
 logger = logging.getLogger(__name__)
+
+
+class CustomedFusionLayer(nn.Module):
+    def __init__(self, type=None, in_size=0, out_size=0, head_nums=1, attention_dropout=0.1):
+        super().__init__()
+        self.type = type # None, 'mean', 'interpolate_0', 'interpolate_others', 'add', 'concat_0', 'concat_others', 'attention_0', 'attention_others'
+        
+        self.layer_norm = LayerNorm(in_size)
+        if type == 'interpolate_0' or type == 'interpolate_others':
+            self.noisy_weight = nn.Parameter(torch.tensor(0.001))
+            
+        if type == 'concat_0' or type == 'concat_others':
+            self.fusion_layer = nn.Linear(2 * in_size, out_size)
+        elif type == 'attention_0' or type == 'attention_others':
+            self.fusion_layer_1 = MultiheadAttention(in_size, head_nums, dropout=attention_dropout)
+            self.fusion_layer_2 = MultiheadAttention(in_size, head_nums, dropout=attention_dropout)
+
+    def forward(self, enh:torch.Tensor, noisy:torch.Tensor):
+        if self.type is None:
+            return enh
+        elif self.type == 'dummy':
+            return enh
+        elif self.type == 'mean':
+            return (enh + noisy) / 2
+        elif self.type == 'interpolate_0':
+            # first layer: B x T x C
+            enh_ = enh
+            enh = enh + noisy * self.noisy_weight
+            # enh = self.layer_norm(enh)
+            return enh
+        if self.type == 'interpolate_others':
+            # other layers: T x B x C
+            enh_ = enh
+            enh = enh + noisy * self.noisy_weight
+            # enh = self.layer_norm(enh)
+            return enh
+        elif self.type == 'add':
+            return enh + noisy
+        elif self.type == 'concat_0':
+            # first layer: B x T x C 
+            enh_ = enh
+            enh = self.fusion_layer(torch.cat([enh, noisy], dim=-1))
+            enh = self.layer_norm(enh) + enh_
+            return enh
+        elif self.type == 'concat_others':
+            # other layers: T x B x C
+            enh_ = enh
+            enh = self.fusion_layer(torch.cat([enh, noisy], dim=-1))
+            enh = self.layer_norm(enh) + enh_
+            return enh
+        elif self.type == 'attention_0':
+            # first layer: B x T x C -> T x B x C -> B x T x C
+            enh = enh.transpose(0,1)
+            noisy = noisy.transpose(0,1)
+            enh_ = enh
+            x_1, attn_1 = self.fusion_layer_1(
+                query=enh,
+                key=noisy,
+                value=noisy,
+            )
+            x_2, attn_2 = self.fusion_layer_2(
+                query=noisy,
+                key=enh,
+                value=enh,
+            )
+            enh = x_1 + x_2
+            enh = self.layer_norm(enh) + enh_
+
+            enh = enh.transpose(0,1)
+            return enh
+        elif self.type == 'attention_others':
+            # other layers: T x B x C
+            enh_ = enh
+            x_1, attn_1 = self.fusion_layer_1(
+                query=enh,
+                key=noisy,
+                value=noisy,
+            )
+            x_2, attn_2 = self.fusion_layer_2(
+                query=noisy,
+                key=enh,
+                value=enh,
+            )
+            enh = x_1 + x_2
+            enh = self.layer_norm(enh) + enh_
+            return enh
 
 
 @dataclass
@@ -236,6 +328,41 @@ class HubertConfig(FairseqDataclass):
         metadata={"help": "Positional encoding type to use in conformer"},
     )
     fp16: bool = field(default=False, metadata={"help": "If fp16 is being used"})
+    init: str = field(
+        default="",
+        metadata={
+            "help": "model initialized from path"
+        },
+        )
+    source_enh: bool = field(
+        default=False,
+        metadata={"help": "apply enhancement models to the source or not"},
+    )
+    enh_models: Optional[str] = field(
+        default=None,
+        metadata={"help": "JSON file for enhancement models and their paths"},
+    )
+    debug_mode: int = field(
+        default=1,
+        metadata={"help": "Debug Mode"},
+    )
+    fusion_layer: Optional[str] = field(
+        default=None, # 'mean', 'concat', 'add', 'attention', 'interpolate', 'dummy'
+        metadata={"help": "Fusion layer for the enhanced features"},
+    )
+    fusion_single: bool = field(
+        default=False,
+        metadata={"help": "Single fusion layer or not"},
+    )
+    fusion_last: bool = field(
+        default=False,
+        metadata={"help": "Fusion last layer or not"},
+    )
+    fusion_head_nums: Optional[int] = field(
+        default=1,
+        metadata={"help": "Number of fusion heads"},
+    )
+
 
 
 @register_model("hubert", dataclass=HubertConfig)
@@ -322,6 +449,102 @@ class HubertModel(BaseFairseqModel):
             )
             nn.init.uniform_(self.label_embs_concat)
 
+        # apply enhancement models to the source or not.
+        self.source_enh = cfg.source_enh
+        self.enh_name2meta_info = {}
+        if self.source_enh:
+            with open(cfg.enh_models, "r") as f:
+                obj = json.load(f)
+            self.enh_name2meta_info.update(obj)
+        
+        # import pdb; pdb.set_trace()
+        self.enh_name2model = {}
+
+        for name, path in self.enh_name2meta_info.items():
+            if name in ['ConvTasNet', 'DCCRNet', 'DCUNet', 'DPRNNTasNet', 'DPTNet']:
+                model_cls = getattr(asteroid, name)
+                model = model_cls.from_pretrained(path)
+                for param in model.parameters():
+                    param.requires_grad = False
+                self.enh_name2model[name] = model.cuda() if torch.cuda.is_available() else model
+
+        self.debug_mode = cfg.debug_mode
+        logger.info(f"Debug Mode: {cfg.debug_mode}")
+
+        self.fusion_type = cfg.fusion_layer
+        if self.fusion_type == '': self.fusion_type = None
+        if self.fusion_type is not None:
+            self.encoder_embed_dim = cfg.encoder_embed_dim
+            self.fusion_single = cfg.fusion_single
+            self.fusion_last = cfg.fusion_last
+            fusion_layers_num = 1 + cfg.encoder_layers
+            if self.fusion_type == 'attention':
+                self.fusion_head_nums = cfg.fusion_head_nums
+            self.fusion_layers = self.init_fusion_layers(
+                fusion_layers_num, self.fusion_type, self.fusion_single, self.fusion_last
+                )
+    
+
+    def init_fusion_layers(self, layers_num, type: str, fusion_single=False, fusion_last=False):
+        module_list = None
+        if fusion_single:
+            if type == 'mean':
+                module_list = [CustomedFusionLayer('mean')]
+            elif type == 'dummy':
+                module_list = [CustomedFusionLayer('dummy')]
+            elif type == 'add':
+                module_list = [CustomedFusionLayer('add')]
+            elif type == 'concat':
+                module_list = [CustomedFusionLayer('concat_0', self.embed, self.embed)]
+            elif type == 'attention':
+                module_list = [CustomedFusionLayer('attention_0', self.embed, head_nums=self.fusion_head_nums)]
+            elif type == 'interpolate':
+                module_list = [CustomedFusionLayer('interpolate_0', self.embed)]
+            elif type is None:
+                module_list = [CustomedFusionLayer(None)]
+            else: raise NotImplementedError
+            module_list.extend([CustomedFusionLayer(None)] * (layers_num - 1))
+            return nn.ModuleList(module_list)
+        if fusion_last:
+            module_list = [CustomedFusionLayer(None)] * (layers_num - 1)
+            if type == 'mean':
+                module_list.append(CustomedFusionLayer('mean'))
+            elif type == 'dummy':
+                module_list.append(CustomedFusionLayer('dummy'))
+            elif type == 'add':
+                module_list.append(CustomedFusionLayer('add'))
+            elif type == 'concat':
+                module_list.append(CustomedFusionLayer('concat_others', self.encoder_embed_dim, self.encoder_embed_dim))
+            elif type == 'attention':
+                module_list.append(CustomedFusionLayer('attention_others', self.encoder_embed_dim, head_nums=self.fusion_head_nums))
+            elif type == 'interpolate':
+                module_list.append(CustomedFusionLayer('interpolate_others', self.encoder_embed_dim))
+            elif type is None:
+                module_list.append(CustomedFusionLayer(None))
+            else: raise NotImplementedError
+            return nn.ModuleList(module_list)
+
+        if type == 'mean':
+            module_list = [CustomedFusionLayer('mean')] * layers_num
+        elif type == 'dummy':
+            module_list = [CustomedFusionLayer('dummy')] * layers_num
+        elif type == 'add':
+            module_list = [CustomedFusionLayer('add')] * layers_num
+        elif type == 'concat':
+            module_list = [CustomedFusionLayer('concat_0', self.embed, self.embed)] + \
+                    [CustomedFusionLayer('concat_others', self.encoder_embed_dim, self.encoder_embed_dim) for _ in range(layers_num - 1)]
+        elif type == 'attention':
+            module_list = [CustomedFusionLayer('attention_0', self.embed, head_nums=self.fusion_head_nums)] + \
+                    [CustomedFusionLayer('attention_others', self.encoder_embed_dim, head_nums=self.fusion_head_nums) for _ in range(layers_num - 1)]
+        elif type == 'interpolate':
+            module_list = [CustomedFusionLayer('interpolate_0', self.embed)] + \
+                    [CustomedFusionLayer('interpolate_others', self.encoder_embed_dim) for _ in range(layers_num - 1)]
+        elif type is None:
+            module_list = [CustomedFusionLayer(None)] * layers_num
+        else: raise NotImplementedError
+        return nn.ModuleList(module_list)
+
+
     def upgrade_state_dict_named(self, state_dict, name):
         """Upgrade a (possibly old) state dict for new versions of fairseq."""
 
@@ -333,9 +556,18 @@ class HubertModel(BaseFairseqModel):
         """Build a new model instance."""
 
         model = HubertModel(cfg, task.cfg, task.dictionaries)
+        if cfg.init is not None:
+            
+            state = checkpoint_utils.load_checkpoint_to_cpu(cfg.init, {})
+            model_dict = model.state_dict()
+            state_dict = {k:v for k,v in state['model'].items() if k in model_dict.keys()}
+            model_dict.update(state_dict)
+            model.load_state_dict(model_dict, strict=True)
+            # model.load_state_dict(state["model"], strict=True)
+            logger.info(f"model initialized from {cfg.init}")
         return model
 
-    def apply_mask(self, x, padding_mask, target_list):
+    def apply_mask(self, x, padding_mask, target_list, x_noisy=None):
         B, T, C = x.shape
         if self.mask_prob > 0:
             mask_indices = compute_mask_indices(
@@ -351,6 +583,7 @@ class HubertModel(BaseFairseqModel):
             )
             mask_indices = torch.from_numpy(mask_indices).to(x.device)
             x[mask_indices] = self.mask_emb
+            if x_noisy is not None: x_noisy[mask_indices] = self.mask_emb
         else:
             mask_indices = None
 
@@ -372,8 +605,9 @@ class HubertModel(BaseFairseqModel):
                 .expand(-1, T, -1)
             )
             x[mask_channel_indices] = 0
+            if x_noisy is not None: x_noisy[mask_channel_indices] = 0
 
-        return x, mask_indices
+        return x, x_noisy, mask_indices
 
     def compute_nce(self, x, pos, negs):
         neg_is_pos = (pos == negs).all(-1)
@@ -410,7 +644,7 @@ class HubertModel(BaseFairseqModel):
             features = features[..., :feat_tsz]
         target_inds = torch.arange(feat_tsz).float() * self.feat2tar_ratio
         target_list = [t[:, target_inds.long()] for t in target_list]
-        return features, target_list
+        return features, target_list, feat_tsz
 
     def forward_padding_mask(
         self,
@@ -424,7 +658,62 @@ class HubertModel(BaseFairseqModel):
         padding_mask = padding_mask.all(-1)
         return padding_mask
 
-    def forward(
+    def enh_partial(self, model, source_aug, source=None, max_enh_samples = 16000 * 10):
+        # import pdb; pdb.set_trace()
+        assert source_aug.dim() == 2
+        max_duration = source_aug.size(1)
+
+        if max_duration <= max_enh_samples:
+            return model(source_aug).squeeze(1)
+        else:
+            # debug1: disable mixures of enhanced and noisy speech
+            if self.debug_mode==1:
+                return source_aug
+            
+            # debug2: replace enhanced segment with original speech
+            elif self.debug_mode==2:
+                # breakpoint()
+                start = np.random.randint(0, max_duration - max_enh_samples)
+                source_aug[:, start:start + max_enh_samples] = source[:, start:start + max_enh_samples]
+                return source_aug
+
+            # debug3: normalize volumn of enhanced segment with (max volumn of the corresponding original segment)
+            elif self.debug_mode==3:
+                start = np.random.randint(0, max_duration - max_enh_samples)
+                original_segment = source[:, start:start + max_enh_samples]
+                enhanced_segment = model(source_aug[:, start:start + max_enh_samples]).squeeze(1)
+                original_max = torch.max(original_segment, axis=1, keepdim=True)[0]
+                enhanced_max = torch.max(enhanced_segment, axis=1, keepdim=True)[0]
+                norm = torch.maximum(original_max, enhanced_max)
+                norm[norm < 1e-5] = 1
+                enhanced_segment /= norm
+                source_aug[:, start:start+max_enh_samples] = enhanced_segment
+                return source_aug
+
+    def norm_source_aug(self, origin_source, enhanced_source):
+        original_max = torch.max(origin_source, axis=1, keepdim=True)[0]
+        enhanced_max = torch.max(enhanced_source, axis=1, keepdim=True)[0]
+        norm = torch.maximum(original_max, enhanced_max)
+        norm[norm < 1e-5] = 1
+        enhanced_source /= norm
+        return enhanced_source
+
+
+    # def fusion(self, clean:torch.Tensor, noisy:torch.Tensor, type=None):
+    #     assert noisy.shape == clean.shape
+    #     if type is None: type = self.fusion_type
+    #     if type == 'mean':
+    #         return (noisy + clean) / 2
+    #     if type == 'add':
+    #         return noisy + clean
+    #     elif type == 'concat':
+    #         return torch.cat([noisy, clean], dim=1)
+    #     elif type is None or type == '':
+    #         return clean
+    #     else: raise NotImplementedError
+
+
+    def forward_source_only(
         self,
         source: torch.Tensor,
         target_list: Optional[List[torch.Tensor]] = None,
@@ -433,16 +722,18 @@ class HubertModel(BaseFairseqModel):
         features_only: bool = False,
         output_layer: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
+
+        
         """output layer is 1-based"""
         features = self.forward_features(source)
         if target_list is not None:
-            features, target_list = self.forward_targets(features, target_list)
+            features, target_list, feat_tsz = self.forward_targets(features, target_list)
 
         features_pen = features.float().pow(2).mean()
 
         features = features.transpose(1, 2)
         features = self.layer_norm(features)
-        unmasked_features = features.clone()
+        # unmasked_features = features.clone() # What use?
 
         if padding_mask is not None:
             padding_mask = self.forward_padding_mask(features, padding_mask)
@@ -451,10 +742,10 @@ class HubertModel(BaseFairseqModel):
             features = self.post_extract_proj(features)
 
         features = self.dropout_input(features)
-        unmasked_features = self.dropout_features(unmasked_features)
+        # unmasked_features = self.dropout_features(unmasked_features)
 
         if mask:
-            x, mask_indices = self.apply_mask(features, padding_mask, target_list)
+            x, _, mask_indices = self.apply_mask(features, padding_mask, target_list)
         else:
             x = features
             mask_indices = None
@@ -465,7 +756,160 @@ class HubertModel(BaseFairseqModel):
         # padding_mask: (B, T), bool
         # mask_indices: (B, T), bool
         x, _ = self.encoder(
-            x,
+            x, None, fusion_layers=None,
+            padding_mask=padding_mask,
+            layer=None if output_layer is None else output_layer - 1,
+        )
+
+        if features_only:
+            return {"x": x, "padding_mask": padding_mask, "features": features}
+
+        def compute_pred(proj_x, target, label_embs):
+            # compute logits for the i-th label set
+            y = torch.index_select(label_embs, 0, target.long())
+            negs = label_embs.unsqueeze(1).expand(-1, proj_x.size(0), -1)
+            if self.target_glu:
+                y = self.target_glu(y)
+                negs = self.target_glu(negs)
+            # proj_x: (S, D)
+            # y: (S, D)
+            # negs: (Neg, S, D)
+            return self.compute_nce(proj_x, y, negs)
+
+        label_embs_list = self.label_embs_concat.split(self.num_classes, 0)
+
+        if not self.skip_masked:
+            masked_indices = torch.logical_and(~padding_mask, mask_indices)
+            proj_x_m = self.final_proj(x[masked_indices])
+            if self.untie_final_proj:
+                proj_x_m_list = proj_x_m.chunk(len(target_list), dim=-1)
+            else:
+                proj_x_m_list = [proj_x_m for _ in range(len(target_list))]
+            logit_m_list = [
+                compute_pred(proj_x_m, t[masked_indices], label_embs_list[i])
+                for i, (proj_x_m, t) in enumerate(zip(proj_x_m_list, target_list))
+            ]
+        else:
+            logit_m_list = [None for _ in target_list]
+
+        if not self.skip_nomask:
+            nomask_indices = torch.logical_and(~padding_mask, ~mask_indices)
+            proj_x_u = self.final_proj(x[nomask_indices])
+            if self.untie_final_proj:
+                proj_x_u_list = proj_x_u.chunk(len(target_list), dim=-1)
+            else:
+                proj_x_u_list = [proj_x_u for _ in range(len(target_list))]
+
+            logit_u_list = [
+                compute_pred(proj_x_u, t[nomask_indices], label_embs_list[i])
+                for i, (proj_x_u, t) in enumerate(zip(proj_x_u_list, target_list))
+            ]
+        else:
+            logit_u_list = [None for _ in target_list]
+
+        result = {
+            "logit_m_list": logit_m_list,
+            "logit_u_list": logit_u_list,
+            "padding_mask": padding_mask,
+            "features_pen": features_pen,
+        }
+        return result
+
+    def forward(
+        self,
+        source: torch.Tensor,
+        source_aug: torch.Tensor = None,
+        already_enhanced: bool = False,
+        target_list: Optional[List[torch.Tensor]] = None,
+        padding_mask: Optional[torch.Tensor] = None,
+        mask: bool = True,
+        features_only: bool = False,
+        output_layer: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        # if self.fusion_type == 'attention' and self.fusion_single == False and self.fusion_last == False:
+        #     breakpoint()
+        if os.environ.get("DEBUG", False) == "True":
+            breakpoint()
+        make_fuse = not self.fusion_type is None
+        if not make_fuse or os.environ.get("DEBUG", False) == "True":
+            if source_aug is not None:
+                # already enhanced
+                # source is the enhanced source and source_aug is the original noisy source
+                source = self.norm_source_aug(source_aug, source)
+            return self.forward_source_only(source, target_list, padding_mask, mask, features_only, output_layer)
+        
+        if source_aug is not None:
+            source_noisy = source_aug.clone().detach()
+            if self.source_enh and not already_enhanced:
+                name = random.choice(list(self.enh_name2model.keys()))
+                enh_model = self.enh_name2model[name]
+                # logger.info(f"{name} is applied to the source.")
+                with torch.no_grad():
+                    with torch.cuda.amp.autocast():
+                        source_aug = self.enh_partial(enh_model, source_aug, source)
+                source = source_aug
+            else: # already enhanced
+                # source is the enhanced source
+                source = self.norm_source_aug(source_aug, source)
+        else: 
+            source_noisy = source.clone().detach()
+
+        # breakpoint()
+        # sf.write("source0.wav",source[0].float().cpu(),16000)
+
+        
+        """output layer is 1-based"""
+        features = self.forward_features(source)
+        with torch.no_grad():
+            features_noisy = self.forward_features(source_noisy)
+        if target_list is not None:
+            features, target_list, feat_tsz = self.forward_targets(features, target_list)
+            features_noisy = features_noisy[..., :feat_tsz]
+
+
+        features_pen = features.float().pow(2).mean()
+
+        features = features.transpose(1, 2)
+        features = self.layer_norm(features)
+
+        features_noisy = features_noisy.transpose(1, 2)
+        features_noisy = self.layer_norm(features_noisy)
+
+        # FIXME
+        features = self.fusion_layers[0](features, features_noisy)
+
+        if padding_mask is not None:
+            padding_mask = self.forward_padding_mask(features, padding_mask)
+
+        if self.post_extract_proj is not None:
+            features = self.post_extract_proj(features)
+            # FIXME
+            features_noisy = self.post_extract_proj(features_noisy)
+
+        features = self.dropout_input(features)
+        # unmasked_features = self.dropout_features(unmasked_features)
+
+        # FIXME
+        features_noisy = self.dropout_input(features_noisy)
+
+        if mask:
+            # FIXME
+            x, x_noisy, mask_indices = self.apply_mask(features, padding_mask, target_list, features_noisy)
+            # x, x_noisy, mask_indices = self.apply_mask(features, padding_mask, target_list)
+        else:
+            x = features
+            # FIXME
+            x_noisy = features_noisy
+            mask_indices = None
+
+        # feature: (B, T, D), float
+        # target: (B, T), long
+        # x: (B, T, D), float
+        # padding_mask: (B, T), bool
+        # mask_indices: (B, T), bool
+        # FIXME
+        x, _ = self.encoder(
+            x, x_noisy, fusion_layers=self.fusion_layers[1:],
             padding_mask=padding_mask,
             layer=None if output_layer is None else output_layer - 1,
         )
@@ -527,13 +971,15 @@ class HubertModel(BaseFairseqModel):
     def extract_features(
         self,
         source: torch.Tensor,
+        source_aug: torch.Tensor = None,
+        already_enhanced: bool = False,
         padding_mask: Optional[torch.Tensor] = None,
         mask: bool = False,
         ret_conv: bool = False,
         output_layer: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         res = self.forward(
-            source,
+            source, source_aug, already_enhanced=already_enhanced,
             padding_mask=padding_mask,
             mask=mask,
             features_only=True,

@@ -381,7 +381,8 @@ class HubertEncoder(FairseqEncoder):
         self.freeze_finetune_updates = cfg.freeze_finetune_updates
         self.num_updates = 0
 
-        if task.target_dictionary is not None and not cfg.autoregressive:
+        if task.target_dictionary is not None:
+        # if task.target_dictionary is not None and not cfg.autoregressive:
             self.proj = Linear(d, len(task.target_dictionary))
         elif getattr(cfg, "decoder_embed_dim", d) != d:
             self.proj = Linear(d, cfg.decoder_embed_dim)
@@ -393,10 +394,12 @@ class HubertEncoder(FairseqEncoder):
         super().set_num_updates(num_updates)
         self.num_updates = num_updates
 
-    def forward(self, source, padding_mask, tbc=True, **kwargs):
+    def forward(self, source, source_aug, already_enhanced, padding_mask, tbc=True, **kwargs):
 
         w2v_args = {
             "source": source,
+            "source_aug": source_aug,
+            "already_enhanced": already_enhanced,
             "padding_mask": padding_mask,
             "mask": self.apply_mask and self.training,
         }

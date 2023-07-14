@@ -1,0 +1,7 @@
+{
+"DCCRNet": "https://huggingface.co/JorisCos/DCCRNet_Libri1Mix_enhsingle_16k",
+"DPRNNTasNet": "https://huggingface.co/JorisCos/DPRNNTasNet-ks2_Libri1Mix_enhsingle_16k",
+"DCUNet": "https://huggingface.co/JorisCos/DCUNet_Libri1Mix_enhsingle_16k",
+"DPTNet": "https://huggingface.co/JorisCos/DPTNet_Libri1Mix_enhsingle_16k",
+"ConvTasNet": "https://huggingface.co/JorisCos/ConvTasNet_Libri1Mix_enhsingle_16k"
+}

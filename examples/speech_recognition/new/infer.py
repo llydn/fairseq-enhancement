@@ -39,6 +39,7 @@ from omegaconf import OmegaConf
 
 import hydra
 from hydra.core.config_store import ConfigStore
+from omegaconf import MISSING
 
 logging.root.setLevel(logging.INFO)
 logging.basicConfig(level=logging.INFO)
@@ -70,6 +71,7 @@ class InferConfig(FairseqDataclass):
     checkpoint: CheckpointConfig = CheckpointConfig()
     distributed_training: DistributedTrainingConfig = DistributedTrainingConfig()
     dataset: DatasetConfig = DatasetConfig()
+    model: Any = MISSING
     is_ax: bool = field(
         default=False,
         metadata={
@@ -98,6 +100,7 @@ class InferenceProcessor:
 
     def __init__(self, cfg: InferConfig) -> None:
         self.cfg = cfg
+
         self.task = tasks.setup_task(cfg.task)
 
         models, saved_cfg = self.load_model_ensemble()

@@ -999,8 +999,8 @@ class TransformerEncoder(nn.Module):
 
         self.apply(init_bert_params)
 
-    def forward(self, x, padding_mask=None, layer=None):
-        x, layer_results = self.extract_features(x, padding_mask, layer)
+    def forward(self, x, x_noisy, fusion_layers=None, padding_mask=None, layer=None):
+        x, layer_results = self.extract_features(x, x_noisy, fusion_layers, padding_mask, layer)
 
         if self.layer_norm_first and layer is None:
             x = self.layer_norm(x)
@@ -1010,10 +1010,14 @@ class TransformerEncoder(nn.Module):
     def extract_features(
         self,
         x,
+        x_noisy, 
+        fusion_layers,
         padding_mask=None,
         tgt_layer=None,
         min_layer=0,
     ):
+        if x_noisy is not None and fusion_layers is not None and fusion_layers != []:
+            return self.extract_features_with_fusion(x, x_noisy, fusion_layers, padding_mask, tgt_layer, min_layer)
 
         if padding_mask is not None:
             x = index_put(x, padding_mask, 0)
@@ -1048,7 +1052,101 @@ class TransformerEncoder(nn.Module):
             if not self.training or (dropout_probability > self.layerdrop):
                 x, (z, lr) = layer(
                     x, self_attn_padding_mask=padding_mask, need_weights=False
+                ) # out, attention_weight, layer_result
+                if i >= min_layer:
+                    layer_results.append((x, z, lr))
+            if i == tgt_layer:
+                r = x
+                break
+
+        if r is not None:
+            x = r
+
+        # T x B x C -> B x T x C
+        x = x.transpose(0, 1)
+
+        # undo paddding
+        if pad_length > 0:
+            x = x[:, :-pad_length]
+
+            def undo_pad(a, b, c):
+                return (
+                    a[:-pad_length],
+                    b[:-pad_length] if b is not None else b,
+                    c[:-pad_length],
                 )
+
+            layer_results = [undo_pad(*u) for u in layer_results]
+
+        return x, layer_results
+
+    def extract_features_with_fusion(
+        self,
+        x,
+        x_noisy, 
+        fusion_layers,
+        padding_mask=None,
+        tgt_layer=None,
+        min_layer=0,
+    ):
+
+        if padding_mask is not None:
+            x = index_put(x, padding_mask, 0)
+# FIXME
+            x_noisy = index_put(x_noisy, padding_mask, 0)
+
+        # breakpoint()
+
+        x_conv = self.pos_conv(x.transpose(1, 2))
+        x_conv = x_conv.transpose(1, 2)
+        x = x + x_conv
+
+# FIXME
+        x_noisy_conv = self.pos_conv(x_noisy.transpose(1, 2)).detach()
+        x_noisy_conv = x_noisy_conv.transpose(1, 2)
+        x_noisy = x_noisy + x_noisy_conv
+
+        if not self.layer_norm_first:
+            x = self.layer_norm(x)
+# FIXME
+            x_noisy = self.layer_norm(x_noisy)
+
+        # pad to the sequence length dimension
+        x, pad_length = pad_to_multiple(
+            x, self.required_seq_len_multiple, dim=-2, value=0
+        )
+# FIXME
+        x_noisy, _ = pad_to_multiple(
+            x_noisy, self.required_seq_len_multiple, dim=-2, value=0
+        )
+        if pad_length > 0 and padding_mask is None:
+            padding_mask = x.new_zeros((x.size(0), x.size(1)), dtype=torch.bool)
+            padding_mask[:, -pad_length:] = True
+        else:
+            padding_mask, _ = pad_to_multiple(
+                padding_mask, self.required_seq_len_multiple, dim=-1, value=True
+            )
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        # B x T x C -> T x B x C
+        x = x.transpose(0, 1)
+
+# FIXME
+        x_noisy = F.dropout(x_noisy, p=self.dropout, training=self.training)
+        x_noisy = x_noisy.transpose(0, 1)
+
+        layer_results = []
+        r = None
+        for i, layer in enumerate(self.layers):
+            dropout_probability = np.random.random() if self.layerdrop > 0 else 1
+            if not self.training or (dropout_probability > self.layerdrop):
+                x, (z, lr) = layer(
+                    x, self_attn_padding_mask=padding_mask, need_weights=False
+                ) # out, attention_weight, layer_result
+# FIXME
+                x_noisy, _ = layer(
+                    x_noisy, self_attn_padding_mask=padding_mask, need_weights=False
+                )
+                x = fusion_layers[i](x, x_noisy)
                 if i >= min_layer:
                     layer_results.append((x, z, lr))
             if i == tgt_layer:
@@ -1270,9 +1368,20 @@ class TransformerSentenceEncoderLayer(nn.Module):
 
             x = self.self_attn_layer_norm(x)
 
-            residual = x
+            residual = x                   
             x = self.activation_fn(self.fc1(x))
+            import os
+            if os.environ.get("DEBUG", False) == "True":
+                # breakpoint()
+                # x /= 0.9
+                pass
+                # breakpoint()
+                # self.dropout2.training = True
+            # self.train()
             x = self.dropout2(x)
+            if os.environ.get("DEBUG", False) == "True":
+                pass
+            # self.eval()
             x = self.fc2(x)
 
             layer_result = x
