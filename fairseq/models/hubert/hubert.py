@@ -829,9 +829,10 @@ class HubertModel(BaseFairseqModel):
         # if self.fusion_type == 'attention' and self.fusion_single == False and self.fusion_last == False:
         #     breakpoint()
         if os.environ.get("DEBUG", False) == "True":
-            breakpoint()
+            # breakpoint()
+            pass
         make_fuse = not self.fusion_type is None
-        if not make_fuse or os.environ.get("DEBUG", False) == "True":
+        if not make_fuse:
             if source_aug is not None:
                 # already enhanced
                 # source is the enhanced source and source_aug is the original noisy source

@@ -1372,7 +1372,7 @@ class TransformerSentenceEncoderLayer(nn.Module):
             x = self.activation_fn(self.fc1(x))
             import os
             if os.environ.get("DEBUG", False) == "True":
-                breakpoint()
+                # breakpoint()
                 # x /= 0.9
                 pass
                 # breakpoint()

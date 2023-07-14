@@ -21,6 +21,7 @@ if __name__ == "__main__":
     
 
     total_errs, total_length = 0., 0.
+    old_wer = None
     i = 0
     while i < len(lines):
         if re.match(r".*- HYPO: ", lines[i]):
@@ -42,20 +43,25 @@ if __name__ == "__main__":
         elif re.match(r".*- Word error rate: ", lines[i]):
             old_wer_start = re.match(r".*- Word error rate: ", lines[i]).span()[1]
             old_wer = lines[i][old_wer_start:].strip()
+            assert total_length > 0
+            new_wer = total_errs * 100.0 / total_length
+        elif re.match(r".*current directory is", lines[i]):                
+            total_errs, total_length = 0., 0.
         i += 1
 
-    wer = total_errs * 100.0 / total_length
-
-    new_wer_file_path = os.path.join(os.path.dirname(args.infer_log), args.new_wer_file_name)
-    with open(new_wer_file_path, "w") as f:
-        f.write(
-            (
-                f"WER: {wer}\n"
-                f"err / num_ref_words = {total_errs} / {total_length}\n\n"
+    if old_wer is None:
+        print(f"{args.infer_log} not completed.")
+    else:
+        new_wer_file_path = os.path.join(os.path.dirname(args.infer_log), args.new_wer_file_name)
+        with open(new_wer_file_path, "w") as f:
+            f.write(
+                (
+                    f"WER: {new_wer}\n"
+                    f"err / num_ref_words = {total_errs} / {total_length}\n\n"
+                )
             )
-        )
 
-    print(f"Old WER: {old_wer}\tNew WER: {wer}\nResult written to file {new_wer_file_path}")
+        print(f"Old WER: {old_wer}\tNew WER: {new_wer}\nResult written to file {new_wer_file_path}")
     
             
             
