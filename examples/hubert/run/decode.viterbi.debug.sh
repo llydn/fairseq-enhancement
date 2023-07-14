@@ -6,13 +6,13 @@
 set -e
 set -u
 set -o pipefail
-expdir=exp/finetune/base_100h_finetune_ls_clean_100_from_fusion_concat_first_50000
+expdir=exp/finetune/base_100h_finetune_ls_clean_100_from_fusion_attention_10000
 #lang=frisian
 data=data
 checkpoint=checkpoint_best.pt
 test_sets="ls_test_clean"
 device=0
-enh_models="DCCRNet"
+enh_models="DCUNet"
 config_name=infer_viterbi_pad_audio_debug
 
 . ./path.sh

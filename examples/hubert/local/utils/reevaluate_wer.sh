@@ -6,10 +6,10 @@ set -e
 set -u
 set -o pipefail
 
-expdirs=$1 # "exp/finetune/base_100h_finetune_ls_clean_100_from_fusion_interpolate_50000 exp/finetune/base_100h_finetune_ls_clean_100_from_fusion_interpolate_40000"
+expdirs= # "exp/finetune/base_100h_finetune_ls_clean_100_from_fusion_interpolate_50000 exp/finetune/base_100h_finetune_ls_clean_100_from_fusion_interpolate_40000"
 log_dir=RESULTS
 decode_subdir=viterbi_pad_audio
-wer_file=wer.filtered
+new_wer_file=wer.filtered
 replace_exist=false
 
 # decode_path fusion enhance_model finetune_set test_set checkpoint wer
@@ -27,12 +27,12 @@ for expdir in $expdirs; do
         if [ ! -e $decode_wer_path ] || [ ! -e $decode_infer_path ]; then
             continue
         fi
-        if [ -e ${decode_wer_dir}/${wer_file} ] && [ $replace_exist == false ]; then
+        if [ -e ${decode_wer_dir}/${new_wer_file} ] && [ $replace_exist == false ]; then
             continue
         fi
         python local/utils/reevaluate_wer.py \
         --infer_log $decode_infer_path \
-        --new_wer_file_name ${wer_file} >> ${log_file} 2>&1
+        --new_wer_file_name ${new_wer_file} >> ${log_file} 2>&1
     done
 done
 
